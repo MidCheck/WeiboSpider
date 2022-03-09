@@ -73,13 +73,92 @@ class WeiboSpider:
             self.log.warning("[-] [%s](%s) not has info time" % (self.driver.current_url, feed['mid']))
         else:
             feed['time'] = info_time_elem.text
-        
+
         try:
+            # get weibo content
             wbtext_elem = self.driver.find_element(By.XPATH, '//div[starts-with(@class, "detail_wbtext_")]')
         except NoSuchElementException:
             self.log.warning("[-] [%s](%s) not has detail webtext" % (self.driver.current_url, feed['mid']))
         else:
             feed['content'] = wbtext_elem.text
+
+        # get weibo comments
+        feed['comments'] = { 'set': set(), 'comms': list(), 'finish': None }
+        self.new_tab_comments(feed['comments'])
+
+    def new_tab_comments(self, comments: dict):
+        self.driver.execute_script('window.scrollBy(0, document.body.scrollHeigth)')
+        is_finish = False
+        comments_set = set()
+        last_time = time.time()
+        while not is_finish:
+            try:
+                items = self.driver.find_elements(By.CLASS_NAME, "vue-recycle-scroller__item-view")
+            except NoSuchElementException:
+                self.log.warning("[-] [%s] not has detail comments" % (self.driver.current_url))
+                break
+            else:
+                if comments['finish'] is not None or len(items) == 0:
+                    is_finish = True
+                for item in items:
+                    try:
+                        comm_res = re.findall(r"(.*)\s?:(.*)\s((?:\d{,2}\-?){3}\s?(?:\d{1,2}:\d{1,2}))\s?", item.text)
+                        if not comm_res:
+                            continue
+                        hash_str = ''.join([comm_res[0][0], comm_res[0][1], comm_res[0][2]])
+                        if hash_str in comments_set:
+                            continue
+                        comments_set.add(hash_str)
+                        scroller_elem: WebElement = item.find_element(By.CLASS_NAME, "wbpro-scroller-item")
+                        data_index = int(scroller_elem.get_attribute("data-index"))
+                        comments['set'].add(data_index)
+                        is_finish = False
+                        last_time = time.time()
+                    except NoSuchElementException as e:
+                        self.log.warning("[-] [%s] has no wbpro-scroller-item: %s" % (self.driver.current_url, str(e)))
+                    except ValueError as e:
+                        self.log.warning("[-] [%s] has value error: %s" % (self.driver.current_url, str(e)))
+                    else:
+                        try:
+                            uid = ''
+                            uid_elem = scroller_elem.find_element(By.TAG_NAME, "a")
+                            if res := re.findall("/u/(\d+)", uid_elem.get_attribute('href')):
+                                uid = res[0]
+                        except NoSuchElementException:
+                            pass
+                        finally:
+                            for nick_name, comment_content, comment_time in comm_res:
+                                comments['comms'].append((uid, nick_name, comment_time, comment_content))
+            finally:
+                try:
+                    bottom_elem = self.driver.find_element(By.XPATH, "//div[starts-with(@class, 'Bottom_text_')]")
+                except NoSuchElementException:
+                    try:
+                        if es := self.driver.find_elements(By.XPATH, "//span[@class='woo-tip-text']"):
+                            for e in es:
+                                if e.text.find("加载失败") > 0:
+                                    e.click()
+                                    time.sleep(1)
+                                    break
+                                elif e.text.find("发表你的评论或") > 0:
+                                    comments['finish'] = e.text
+                                    is_finish = True
+                                    break   
+                    except NoSuchElementException:
+                        pass
+                    finally:
+                        self.driver.execute_script('window.scrollBy(0, 200)')
+                        time_distance = int(time.time() - last_time)
+                        if time_distance > 30:
+                            self.driver.execute_script('window.scrollBy(0, -500)')
+                        elif time_distance > 100:
+                            self.driver.refresh()
+                            time.sleep(5)
+                        # time.sleep(1)
+                else:
+                    if comments['finish'] is None:
+                        comments['finish'] = bottom_elem.text
+
         
     def new_tab(self, card_feed: WebElement, feed: dict):
         try:
@@ -101,8 +180,8 @@ class WeiboSpider:
                 if pre_handle != handle:
                     self.driver.switch_to.window(handle)
             try:
-                WebDriverWait(self.driver, 5).until(EC.text_to_be_present_in_element_attribute(
-                    (By.XPATH, f'//a[contains(@class, "head-info_time")]'), 'href', link)
+                WebDriverWait(self.driver, 30).until(EC.text_to_be_present_in_element_attribute(
+                    (By.XPATH, f'//a[starts-with(@class, "head-info_time")]'), 'href', link)
                 )
             except TimeoutException:
                 self.log.warning("[-] card [%s](%s) new tab [%s] failed" % (feed['mid'], self.driver.current_url, link))
@@ -163,15 +242,41 @@ class WeiboSpider:
                     feed_lists.append(feed)
             
             return feed_lists
+    
+    def next_page(self, question):
+        try:
+            next_page_elem = self.driver.find_element(By.CLASS_NAME, "next")
+        except NoSuchElementException:
+            return False
+        else:
+            next_page_elem.send_keys(Keys.RETURN)
+            try:
+                WebDriverWait(self.driver, 30).until(EC.text_to_be_present_in_element(
+                    (By.XPATH, '//p[@node-type="feed_list_content"]'), question)
+                )
+            except TimeoutException:
+                return False
+            else:
+                return True
 
-    def crawling(self):
-        feeds = self.get_feed_items()
-        for feed in feeds:
+    def crawling(self, question):
+        all_feeds = []
+        while True:
+            feeds = self.get_feed_items()
+            all_feeds.append(feeds)
+            try:
+                if not self.next_page(question):
+                    break
+            except Exception:
+                break
+
+        for feed in all_feeds:
             print(feed)
 
     def search(self, question: str):
         url = self.search_url + question
         self.driver.get(url)
+        # 处理未搜索到的情况------
         try:
             WebDriverWait(self.driver, 30).until(EC.text_to_be_present_in_element(
                 (By.XPATH, '//p[@node-type="feed_list_content"]'), question)
@@ -181,7 +286,8 @@ class WeiboSpider:
             return False
         else:
             self.log.info("[.] start crawling ...")
-            self.crawling()
+            self.crawling(question)
+        
 
 
 if __name__ == '__main__':
@@ -191,4 +297,3 @@ if __name__ == '__main__':
     
     spider = WeiboSpider(driver_path, chrome_port)
     spider.search(question)
-
